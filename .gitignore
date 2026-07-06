@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.streamlit/
+# 競賽釋出資料僅限競賽用途，禁止進版控
+data/
+*.xlsx
+*.xls
