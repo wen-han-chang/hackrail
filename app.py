@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """RailVolt MVP 儀表板 — streamlit run app.py"""
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -30,7 +31,74 @@ st.title("🚈 RailVolt 軌道虛擬電廠 — MVP 展示")
 st.caption("隊名：綠色的夥伴｜參賽編號 HR-04370｜目前使用**模擬資料**展示完整管線，"
            "競賽資料到手後直接替換資料源（欄位結構已對齊釋出資料）")
 
-tab1, tab2, tab3, tab4 = st.tabs(["📍 行控即時監控", "📊 節能回測", "🎯 載客預測驗證", "⚡ 虛擬電廠試算"])
+tab0, tab1, tab2, tab3, tab4 = st.tabs(
+    ["🚆 單一班次模擬", "📍 行控即時監控", "📊 節能回測", "🎯 載客預測驗證", "⚡ 虛擬電廠試算"])
+
+# ---------- Tab 0 單一班次模擬 ----------
+with tab0:
+    st.subheader("選一班實際班次，看它整趟怎麼開、省多少電")
+    c1, c2, c3 = st.columns(3)
+    veh_name = c1.selectbox("車型", list(sim.VEHICLES.keys()))
+    direction = c2.selectbox("方向", ["南下（往環北）", "北上（往台北）"])
+    tt = sim.timetable()
+    svc_labels = [f"{hhmm(s['dep'])}　{s['kind']}" for s in tt]
+    default_i = next((i for i, s in enumerate(tt)
+                      if s["dep"] == 8 * 60 and s["kind"] == "直達"), 0)
+    svc_i = c3.selectbox("班次（時刻表）", range(len(tt)),
+                         index=default_i, format_func=lambda i: svc_labels[i])
+
+    veh = sim.VEHICLES[veh_name]
+    cmp = sim.trip_compare(tt[svc_i], veh, "南下" if "南下" in direction else "北上")
+    r = cmp["route"]
+
+    st.markdown(
+        f"**{hhmm(r['dep'])} 發車　{tt[svc_i]['kind']}車　{direction}**　｜　"
+        f"{r['n_stops']} 停靠　｜　{r['trip_km']:.1f} km　｜　行駛 {r['arr'] - r['dep']} 分　｜　"
+        f"車型：{veh['cars']} 節・每車 {veh['cap']} 人・空載 {veh['tare_t']} 噸　｜　"
+        f"尖峰載客 {r['occ_peak']:.0f} 人/車")
+
+    m = st.columns(5)
+    m[0].metric("本趟傳統耗電", f"{cmp['base']['total_kwh']:.1f} kWh",
+                help="固定設定 24°C")
+    m[1].metric("本趟 RailVolt 耗電", f"{cmp['rv']['total_kwh']:.1f} kWh",
+                f"-{cmp['saved_pct']:.1%}", delta_color="inverse")
+    m[2].metric("本趟省電", f"{cmp['saved_kwh']:.2f} kWh")
+    m[3].metric("本趟減碳", f"{cmp['saved_co2']:.2f} kg CO₂e")
+    m[4].metric("再生煞車折抵", f"{cmp['rv']['total_regen']:.2f} kWh",
+                help="煞車回饋電能覆蓋的空調用電（供電策略）")
+
+    # 沿線功率剖面
+    labels = [row["label"] for row in cmp["rv"]["rows"]]
+    fig = go.Figure()
+    fig.add_bar(x=labels, y=[row["power_kw"] for row in cmp["base"]["rows"]],
+                name="傳統固定", marker_color="#c55a11")
+    fig.add_bar(x=labels, y=[row["power_kw"] for row in cmp["rv"]["rows"]],
+                name="RailVolt", marker_color="#538135")
+    fig.update_layout(barmode="group", height=280, xaxis_tickangle=-50,
+                      yaxis_title="平均空調功率 kW", margin=dict(t=20, b=10),
+                      legend=dict(orientation="h", y=1.15))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 逐站逐區間明細
+    tbl = []
+    for b, rr in zip(cmp["base"]["rows"], cmp["rv"]["rows"]):
+        if rr["kind"] == "stop":
+            phase, note = "停站", "🚪 開門熱交換・乘降"
+        elif rr["surge"]:
+            phase, note = "行駛", "❄️ 航廈預冷啟動（人流領先指標）"
+        else:
+            phase, note = "行駛", "🚄 加速降載＋煞車再生回充"
+        tbl.append({
+            "位置／區間": rr["label"], "相位": phase,
+            "分": str(rr["minutes"]), "載客/車": str(round(rr["occ"])),
+            "設定°C": f"{rr['setpoint']:.1f}", "功率kW": f"{rr['power_kw']:.1f}",
+            "本段kWh": f"{rr['kwh']:.2f}", "傳統kWh": f"{b['kwh']:.2f}",
+            "再生kWh": f"{rr['regen']:.2f}", "空調策略": note})
+    with st.expander("📋 展開逐站逐區間明細", expanded=True):
+        st.table(pd.DataFrame(tbl).set_index("位置／區間"))
+    st.caption("同一趟班次、相同載客下比較：傳統固定 24°C vs RailVolt 依載客/相位/"
+               "航廈預測動態調節。物理參數為車型標稱量級，真實資料到手後以桃捷實測"
+               "電壓電流校準。")
 
 # ---------- Tab 1 即時監控 ----------
 with tab1:

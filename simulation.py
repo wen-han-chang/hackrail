@@ -162,3 +162,157 @@ def fit_predictor(n_days=12, test_seed=42):
     yhat = np.clip(Xte @ w, 0, None)
     mae = float(np.mean(np.abs(yhat - yte)))
     return dict(w=w, y_true=yte, y_pred=yhat, mae=mae)
+
+
+# ==================================================================
+#  單一班次（實際班表）模擬 — 逐站逐區間的空調策略、供電與省電量
+# ==================================================================
+# 機場捷運全線車站（代碼、站名、累積里程 km）。里程為近似值，
+# 正式版以 TDX「捷運車站間旅行時間」與「站間資料」取代。
+LINE = [
+    ("A1", "台北車站", 0.0), ("A2", "三重", 3.6), ("A3", "新北產業園區", 5.2),
+    ("A4", "新莊副都心", 6.8), ("A5", "泰山", 8.6), ("A6", "泰山貴和", 10.0),
+    ("A7", "體育大學", 13.2), ("A8", "長庚醫院", 15.1), ("A9", "林口", 17.2),
+    ("A10", "山鼻", 19.7), ("A11", "坑口", 22.6), ("A12", "機場第一航廈", 25.9),
+    ("A13", "機場第二航廈", 27.3), ("A14a", "機場旅館", 28.8), ("A15", "大園", 31.6),
+    ("A16", "橫山", 33.6), ("A17", "領航", 35.2), ("A18", "高鐵桃園站", 37.0),
+    ("A19", "桃園體育園區", 39.0), ("A20", "興南", 40.8), ("A21", "環北", 42.5),
+]
+EXPRESS_STOPS = [0, 2, 7, 11, 12, 17, 20]   # 直達車停靠：A1 A3 A8 A12 A13 A18 A21
+AIRPORT_IDX = {11, 12}                        # A12 / A13
+
+# 車型參數（機捷直達車／普通車量級；標稱值，待桃捷實測校準）
+VEHICLES = {
+    "直達車（Express，座位為主・2門）": dict(
+        cars=4, cap=170, tare_t=140, ac_max=42000,
+        c_th=2.2e6, ua=360, ua_door=1800, k_ctrl=22000),
+    "普通車（Commuter，站位為主・3門）": dict(
+        cars=4, cap=250, tare_t=132, ac_max=40000,
+        c_th=2.0e6, ua=380, ua_door=2600, k_ctrl=22000),
+}
+
+
+def timetable():
+    """整日班表：直達每 30 分、普通每 15 分（示意；正式版接 TDX 定期站別時刻表）"""
+    svcs = []
+    for h in range(6, 23):
+        svcs += [dict(dep=h * 60, kind="直達"), dict(dep=h * 60 + 30, kind="直達")]
+        for m in (7, 22, 37, 52):
+            svcs.append(dict(dep=h * 60 + m, kind="普通"))
+    return sorted(svcs, key=lambda s: s["dep"])
+
+
+def _tout_at(minute, rng):
+    return 27 + 6 * _gauss(minute / 60.0, 14.5, 3.5) + rng.normal(0, 0.2)
+
+
+def _board_alight(idx, minute, rng):
+    t = minute / 60.0
+    peak = _gauss(t, 8, 1.2) + _gauss(t, 18, 1.4)
+    if idx in AIRPORT_IDX:
+        board, alight = 70 + 150 * (_gauss(t, 10, 2.5) + _gauss(t, 20, 2.5)), 0.35
+    elif idx in (0, len(LINE) - 1):
+        board, alight = 45 + 130 * peak, 0.55
+    else:
+        board, alight = 18 + 55 * peak, 0.20
+    return max(0.0, board * rng.normal(1, 0.15)), alight
+
+
+def build_trip(service, veh, direction, seed=0):
+    """建立一趟班次的逐分鐘序列（載客、外氣、相位），與空調策略無關。"""
+    rng = np.random.default_rng(seed or service["dep"] * 7 + 1)
+    stops = EXPRESS_STOPS if service["kind"] == "直達" else list(range(len(LINE)))
+    if direction == "北上":
+        stops = stops[::-1]
+    cars, cap = veh["cars"], veh["cap"]
+    occ = np.zeros(cars)
+    clock, leg, steps = service["dep"], 0, []
+    for si, idx in enumerate(stops):
+        board, alight = _board_alight(idx, clock, rng)
+        occ = np.clip(occ * (1 - alight) + board * CAR_W * rng.normal(1, 0.08, cars),
+                      0, cap)
+        steps.append(dict(leg=leg, kind="stop", idx=idx, phase="dwell",
+                          label=f"{LINE[idx][0]} {LINE[idx][1]}",
+                          occ=occ.copy(), tout=_tout_at(clock, rng),
+                          board=board, alight=alight, surge=False))
+        leg += 1; clock += 1
+        if si < len(stops) - 1:
+            nxt = stops[si + 1]
+            dist = abs(LINE[nxt][2] - LINE[idx][2])
+            tmin = max(2, round(dist / (90 if service["kind"] == "直達" else 60) * 60))
+            phases = ["accel"] + ["cruise"] * (tmin - 2) + ["brake"]
+            nb, _ = _board_alight(nxt, clock + tmin, rng)
+            surge = nxt in AIRPORT_IDX and nb > 120
+            for ph in phases:
+                steps.append(dict(leg=leg, kind="seg", idx=idx, phase=ph,
+                                  label=f"{LINE[idx][0]}→{LINE[nxt][0]}",
+                                  occ=occ.copy(), tout=_tout_at(clock, rng),
+                                  surge=surge, dist=dist))
+                clock += 1
+            leg += 1
+    trip_km = abs(LINE[stops[-1]][2] - LINE[stops[0]][2])
+    return dict(steps=steps, service=service, veh=veh, direction=direction,
+                n_stops=len(stops), trip_km=trip_km, dep=service["dep"],
+                arr=clock, occ_peak=float(max(s["occ"].max() for s in steps)))
+
+
+def _car_minute(tin, occ_c, cap, tout, phase, mode, veh, surge):
+    dens = occ_c / cap
+    if mode == "baseline":
+        sp = 24.0
+    else:
+        sp = 26.3 - 2.0 * dens
+        if occ_c < 5:
+            sp = 27.0
+        if surge:
+            sp = min(sp, 25.0)
+    ua = veh["ua"] + (veh["ua_door"] if phase == "dwell" else 0.0)
+    q = float(np.clip(veh["k_ctrl"] * (tin - sp), 0, veh["ac_max"]))
+    if mode == "railvolt":
+        if phase == "brake":
+            q = min(q * 1.6 + (4000 if q > 0 else 0), veh["ac_max"])
+        elif phase == "accel":
+            q = q * 0.45
+    elec = q / COP / 1000 / 60
+    regen = elec * 0.45 if (mode == "railvolt" and phase == "brake") else 0.0
+    tin_new = tin + 60.0 / veh["c_th"] * (occ_c * Q_PERSON + ua * (tout - tin) - q)
+    return tin_new, elec, regen, q / COP / 1000, sp
+
+
+def run_trip(route, mode):
+    """在給定路線上跑一種空調策略，回傳逐區間彙整與全趟總計。"""
+    veh, cars, cap = route["veh"], route["veh"]["cars"], route["veh"]["cap"]
+    tin = np.full(cars, T_INIT)
+    legs, total, totregen, peak = {}, 0.0, 0.0, 0.0
+    for s in route["steps"]:
+        m_kwh = m_regen = m_pw = 0.0
+        sps = []
+        for c in range(cars):
+            tin[c], elec, regen, pw, sp = _car_minute(
+                tin[c], s["occ"][c], cap, s["tout"], s["phase"], mode, veh, s["surge"])
+            m_kwh += elec; m_regen += regen; m_pw += pw; sps.append(sp)
+        peak = max(peak, m_pw); total += m_kwh; totregen += m_regen
+        a = legs.setdefault(s["leg"], dict(
+            kind=s["kind"], label=s["label"], phase=s["phase"], surge=s["surge"],
+            minutes=0, kwh=0.0, regen=0.0, pw_sum=0.0, sp_sum=0.0,
+            occ=float(s["occ"].mean())))
+        a["minutes"] += 1; a["kwh"] += m_kwh; a["regen"] += m_regen
+        a["pw_sum"] += m_pw; a["sp_sum"] += float(np.mean(sps))
+    rows = []
+    for lid in sorted(legs):
+        a = legs[lid]
+        rows.append(dict(kind=a["kind"], label=a["label"], phase=a["phase"],
+                         surge=a["surge"], minutes=a["minutes"], kwh=a["kwh"],
+                         regen=a["regen"], power_kw=a["pw_sum"] / a["minutes"],
+                         setpoint=a["sp_sum"] / a["minutes"], occ=a["occ"]))
+    return dict(rows=rows, total_kwh=total, total_regen=totregen, peak_kw=peak)
+
+
+def trip_compare(service, veh, direction, seed=0):
+    """同一趟班次上比較傳統固定 24°C 與 RailVolt 策略。"""
+    route = build_trip(service, veh, direction, seed)
+    base, rv = run_trip(route, "baseline"), run_trip(route, "railvolt")
+    saved = base["total_kwh"] - rv["total_kwh"]
+    return dict(route=route, base=base, rv=rv, saved_kwh=saved,
+                saved_pct=saved / base["total_kwh"] if base["total_kwh"] else 0.0,
+                saved_co2=saved * CO2_FACTOR)
