@@ -294,18 +294,64 @@ def run_trip(route, mode):
         peak = max(peak, m_pw); total += m_kwh; totregen += m_regen
         a = legs.setdefault(s["leg"], dict(
             kind=s["kind"], label=s["label"], phase=s["phase"], surge=s["surge"],
-            minutes=0, kwh=0.0, regen=0.0, pw_sum=0.0, sp_sum=0.0,
+            minutes=0, kwh=0.0, regen=0.0, pw_sum=0.0, sp_sum=0.0, temp_sum=0.0,
             occ=float(s["occ"].mean())))
         a["minutes"] += 1; a["kwh"] += m_kwh; a["regen"] += m_regen
         a["pw_sum"] += m_pw; a["sp_sum"] += float(np.mean(sps))
+        a["temp_sum"] += float(tin.mean())
     rows = []
     for lid in sorted(legs):
         a = legs[lid]
         rows.append(dict(kind=a["kind"], label=a["label"], phase=a["phase"],
                          surge=a["surge"], minutes=a["minutes"], kwh=a["kwh"],
                          regen=a["regen"], power_kw=a["pw_sum"] / a["minutes"],
-                         setpoint=a["sp_sum"] / a["minutes"], occ=a["occ"]))
+                         setpoint=a["sp_sum"] / a["minutes"], occ=a["occ"],
+                         temp=a["temp_sum"] / a["minutes"]))
     return dict(rows=rows, total_kwh=total, total_regen=totregen, peak_kw=peak)
+
+
+# ---- 牽引電力反推載客（特色二）：由電壓×電流之牽引功率估算列車質量 → 人數 ----
+PERSON_MASS = 65.0            # kg/人（含隨身行李之平均值）
+RHO, CDA, C_ROLL, G = 1.2, 8.0, 0.002, 9.81   # 空氣密度、風阻面積、滾動阻力、重力
+
+
+def infer_load_from_traction(n_trips=60, seed0=200, noise=0.02, n_samples=12):
+    """以模擬牽引功率反推每次出站時之列車載客，並與真值比對。
+    物理：P = (m·a + C_roll·m·g + ½ρ·Cd·A·v²)·v；量測 P、a、v 反解 m。
+    關鍵：乘客僅占全車質量約 3–4%，單點量測噪聲會放大成大幅人數誤差，
+    故對整段加速過程取 n_samples 次功率平均（等效積分），將噪聲降至 1/√n。
+    電力數據為 mock（電壓電流量級），真實資料到手後直接替換 p_meas。"""
+    rng = np.random.default_rng(seed0)
+    a, v = 1.0, 15.0                       # 出站加速度 m/s²、取樣速度 m/s(54km/h)
+    aero = 0.5 * RHO * CDA * v ** 2
+    kinds, names = ["直達", "普通"], list(VEHICLES)
+    true_list, est_list, sample = [], [], None
+    for k in range(n_trips):
+        svc = dict(dep=(6 + k % 16) * 60 + (k * 13) % 60, kind=kinds[k % 2])
+        veh = VEHICLES[names[k % 2]]
+        route = build_trip(svc, veh, "南下" if k % 2 == 0 else "北上", seed0 + k)
+        tare_kg = veh["tare_t"] * 1000
+        for s in route["steps"]:
+            if s["kind"] != "stop":
+                continue
+            true_pax = float(s["occ"].sum())
+            m_true = tare_kg + true_pax * PERSON_MASS
+            p_true = (m_true * a + C_ROLL * m_true * G + aero) * v      # W
+            p_meas = p_true * (1 + rng.normal(0, noise, n_samples))     # 整段加速多點量測
+            m_est = float(np.mean((p_meas / v - aero) / (a + C_ROLL * G)))
+            est_pax = max(0.0, (m_est - tare_kg) / PERSON_MASS)
+            true_list.append(true_pax); est_list.append(est_pax)
+            if sample is None:
+                sample = dict(v=v, a=a, p_true=p_true / 1000,
+                              p_meas=float(p_meas.mean()) / 1000,
+                              m_true=m_true / 1000, m_est=m_est / 1000,
+                              true_pax=true_pax, est_pax=est_pax, tare=veh["tare_t"])
+    t, e = np.array(true_list), np.array(est_list)
+    ss_res = float(np.sum((e - t) ** 2))
+    ss_tot = float(np.sum((t - t.mean()) ** 2))
+    return dict(true=t, est=e, mae=float(np.mean(np.abs(e - t))),
+                r2=1 - ss_res / ss_tot if ss_tot else 0.0, sample=sample,
+                noise=noise)
 
 
 def trip_compare(service, veh, direction, seed=0):

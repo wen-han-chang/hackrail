@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """RailVolt MVP 儀表板 — streamlit run app.py"""
+import datetime as dt
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -19,6 +21,11 @@ def load():
     return day, base, rv, pred
 
 
+@st.cache_data
+def load_infer():
+    return sim.infer_load_from_traction()
+
+
 day, base, rv, pred = load()
 MIN, STATIONS = sim.MIN, sim.STATIONS
 
@@ -31,8 +38,9 @@ st.title("🚈 RailVolt 軌道虛擬電廠 — MVP 展示")
 st.caption("隊名：綠色的夥伴｜參賽編號 HR-04370｜目前使用**模擬資料**展示完整管線，"
            "競賽資料到手後直接替換資料源（欄位結構已對齊釋出資料）")
 
-tab0, tab1, tab2, tab3, tab4 = st.tabs(
-    ["🚆 單一班次模擬", "📍 行控即時監控", "📊 節能回測", "🎯 載客預測驗證", "⚡ 虛擬電廠試算"])
+tab0, tab1, tab2, tab3, tab5, tab4 = st.tabs(
+    ["🚆 單一班次模擬", "📍 行控即時監控", "📊 節能回測", "🎯 載客預測驗證",
+     "🔩 牽引電力反推載客", "⚡ 虛擬電廠試算"])
 
 # ---------- Tab 0 單一班次模擬 ----------
 with tab0:
@@ -69,15 +77,31 @@ with tab0:
 
     # 沿線功率剖面
     labels = [row["label"] for row in cmp["rv"]["rows"]]
+    st.markdown("**沿線空調功率**")
     fig = go.Figure()
     fig.add_bar(x=labels, y=[row["power_kw"] for row in cmp["base"]["rows"]],
                 name="傳統固定", marker_color="#c55a11")
     fig.add_bar(x=labels, y=[row["power_kw"] for row in cmp["rv"]["rows"]],
                 name="RailVolt", marker_color="#538135")
-    fig.update_layout(barmode="group", height=280, xaxis_tickangle=-50,
-                      yaxis_title="平均空調功率 kW", margin=dict(t=20, b=10),
-                      legend=dict(orientation="h", y=1.15))
+    fig.update_layout(barmode="group", height=250, xaxis_tickangle=-50,
+                      yaxis_title="平均空調功率 kW", margin=dict(t=10, b=10),
+                      legend=dict(orientation="h", y=1.2))
     st.plotly_chart(fig, use_container_width=True)
+
+    # 沿線車廂溫度（每站）
+    st.markdown("**沿線車廂溫度（逐站模擬）**")
+    figt = go.Figure()
+    figt.add_hrect(y0=24.5, y1=27.0, fillcolor="#538135", opacity=0.08,
+                   line_width=0, annotation_text="PMV 舒適帶", annotation_position="top left")
+    figt.add_scatter(x=labels, y=[row["temp"] for row in cmp["base"]["rows"]],
+                     name="傳統固定 24°C", line=dict(color="#c55a11"))
+    figt.add_scatter(x=labels, y=[row["temp"] for row in cmp["rv"]["rows"]],
+                     name="RailVolt", line=dict(color="#538135"))
+    figt.update_layout(height=250, xaxis_tickangle=-50, yaxis_title="車廂溫度 °C",
+                       margin=dict(t=10, b=10), legend=dict(orientation="h", y=1.2))
+    st.plotly_chart(figt, use_container_width=True)
+    st.caption("傳統固定設定使車廂長期偏冷（浪費電）；RailVolt 讓溫度貼著舒適帶上緣走，"
+               "省電同時避免過冷。溫度由車廂熱力模型逐分鐘模擬。")
 
     # 逐站逐區間明細
     tbl = []
@@ -102,10 +126,11 @@ with tab0:
 
 # ---------- Tab 1 即時監控 ----------
 with tab1:
-    idx = st.select_slider("模擬日時刻（06:00–23:00，每分鐘一步）",
-                           options=list(range(sim.N)), value=300,
-                           format_func=lambda i: hhmm(MIN[i]),
-                           help="拖動觀察一天營運中任一時刻的列車狀態")
+    t_sel = st.slider("模擬日時刻", min_value=dt.time(6, 0),
+                      max_value=dt.time(22, 58), value=dt.time(11, 0),
+                      step=dt.timedelta(minutes=2),
+                      help="拖動觀察一天營運中任一時刻的列車狀態")
+    idx = min(sim.N - 1, t_sel.hour * 60 + t_sel.minute - sim.T_START)
     st.subheader(f"⏱ {hhmm(MIN[idx])}｜車次 1236（模擬）")
     ph, s_now, s_next = day["route"][idx]
     pos_txt = f"停靠 {STATIONS[s_now]}" if ph == "dwell" else \
@@ -180,6 +205,40 @@ with tab3:
                        yaxis_title="預測上車人數", margin=dict(t=30, b=10))
     st.plotly_chart(fig2, use_container_width=True)
     st.metric("測試日平均絕對誤差 (MAE)", f"{pred['mae']:.1f} 人／班次")
+
+# ---------- Tab 5 牽引電力反推載客 ----------
+with tab5:
+    st.subheader("牽引電力反推列車載客（特色二・電力數據為 mock）")
+    st.markdown(
+        "原理：出站加速時 **牽引功率 P =(m·a + 阻力)·v**，量測 P、由速度求加速度 a，"
+        "反解車重 m，扣除空車重即得乘客數。乘客僅占全車質量約 3–4%，單點量測噪聲"
+        "會放大成大幅人數誤差，故對整段加速多點平均以壓低噪聲。*純物理反演，非黑箱 AI。*")
+    inf = load_infer()
+    sp = inf["sample"]
+    cc = st.columns(4)
+    cc[0].metric("反推 MAE", f"{inf['mae']:.1f} 人／列")
+    cc[1].metric("R²（判定係數）", f"{inf['r2']:.3f}")
+    cc[2].metric("驗證樣本數", f"{len(inf['true'])} 筆")
+    cc[3].metric("量測噪聲設定", f"±{inf['noise']:.0%}")
+
+    figi = go.Figure()
+    lim = float(max(inf["true"].max(), inf["est"].max())) * 1.05
+    figi.add_scatter(x=inf["true"], y=inf["est"], mode="markers",
+                     marker=dict(color="#2e75b6", size=6, opacity=0.45),
+                     name="出站事件")
+    figi.add_scatter(x=[0, lim], y=[0, lim], mode="lines",
+                     line=dict(dash="dash", color="gray"), name="完美反推")
+    figi.update_layout(height=380, xaxis_title="實際載客（人/列）",
+                       yaxis_title="牽引電力反推載客（人/列）",
+                       margin=dict(t=20, b=10), legend=dict(orientation="h", y=1.15))
+    st.plotly_chart(figi, use_container_width=True)
+
+    st.info(
+        f"範例｜真實 {sp['true_pax']:.0f} 人（車重 {sp['m_true']:.1f} 噸，空車 "
+        f"{sp['tare']:.0f} 噸）→ 量測牽引功率 {sp['p_meas']:.0f} kW → 反解 "
+        f"{sp['m_est']:.1f} 噸 → 反推 {sp['est_pax']:.0f} 人")
+    st.caption("桃捷未釋出逐車廂載客數，本法用已釋出的電力（電壓×電流）自建載客標籤，"
+               "餵給空調決策；正式版並以北捷『各車廂實測載重』交叉驗證。目前電力為 mock。")
 
 # ---------- Tab 4 VPP ----------
 with tab4:
