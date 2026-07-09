@@ -38,9 +38,9 @@ st.title("🚈 RailVolt 軌道虛擬電廠 — MVP 展示")
 st.caption("隊名：綠色的夥伴｜參賽編號 HR-04370｜目前使用**模擬資料**展示完整管線，"
            "競賽資料到手後直接替換資料源（欄位結構已對齊釋出資料）")
 
-tab0, tab1, tab2, tab3, tab5, tab4 = st.tabs(
-    ["🚆 單一班次模擬", "📍 行控即時監控", "📊 節能回測", "🎯 載客預測驗證",
-     "🔩 牽引電力反推載客", "⚡ 虛擬電廠試算"])
+tab0, tab1, tab2, tab6, tab3, tab5, tab4 = st.tabs(
+    ["🚆 單一班次模擬", "📍 行控即時監控", "📊 節能回測", "🎛️ 空調最佳化",
+     "🎯 載客預測驗證", "🔩 牽引電力反推載客", "⚡ 虛擬電廠試算"])
 
 # ---------- Tab 0 單一班次模擬 ----------
 with tab0:
@@ -189,6 +189,79 @@ with tab2:
               f"{rv['comfort'] - base['comfort']:+.0%}")
     st.caption(f"另計：煞車窗口再生電能折抵約 {rv['regen']:.1f} kWh/日（試算值）。"
                "所有參數為文獻量級，實測資料到手後以真實電壓電流回測取代。")
+
+# ---------- Tab 6 空調最佳化 ----------
+with tab6:
+    st.subheader("空調節能最佳化：手動調參數，或讓系統跑出最佳解")
+    KEYMAP = {"base_sp": "o_base", "load_gain": "o_gain", "empty_sp": "o_empty",
+              "precool_thresh": "o_pth", "precool_sp": "o_psp",
+              "brake_gain": "o_bg", "accel_relief": "o_ar"}
+    for pk, kk in KEYMAP.items():
+        st.session_state.setdefault(kk, float(sim.DEFAULT_POLICY[pk]))
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**① 手動調整控制參數（即時看結果）**")
+        pol = dict(
+            base_sp=st.slider("基準設定溫度 °C（滿載目標）", 25.5, 27.0,
+                              key="o_base", step=0.1),
+            load_gain=st.slider("載客敏感度（越大越隨人調溫）", 0.0, 3.5,
+                                key="o_gain", step=0.1),
+            empty_sp=st.slider("空車漂移設定 °C", 26.5, 28.0, key="o_empty", step=0.1),
+            precool_thresh=st.slider("預冷觸發門檻（預測增量・人）", 20.0, 90.0,
+                                     key="o_pth", step=1.0),
+            precool_sp=st.slider("預冷目標 °C", 24.5, 26.0, key="o_psp", step=0.1),
+            brake_gain=st.slider("煞車耦合倍數（1＝不用再生）", 1.0, 2.0,
+                                 key="o_bg", step=0.05),
+            accel_relief=st.slider("加速降載係數", 0.3, 1.0, key="o_ar", step=0.05),
+        )
+        r = sim.simulate(day, policy=pol)
+        save = (base["kwh"] - r["kwh"]) / base["kwh"]
+        mm = st.columns(3)
+        mm[0].metric("本策略日耗電", f"{r['kwh']:.0f} kWh",
+                     f"-{save:.1%}", delta_color="inverse")
+        mm[1].metric("乘客舒適時間比", f"{r['comfort']:.0%}")
+        mm[2].metric("再生折抵", f"{r['regen']:.1f} kWh")
+        if r["comfort"] < 0.85:
+            st.warning("⚠️ 舒適度偏低（車廂過熱或過冷），建議調整參數")
+
+    with right:
+        st.markdown("**② 自動搜尋最佳解**（隨機搜尋，物理模擬為評估器）")
+        ctarget = st.slider("舒適度下限約束", 0.85, 1.0, 0.92, 0.01)
+        if st.button("🔍 執行最佳化搜尋（約 8 秒）", type="primary"):
+            with st.spinner("在參數空間搜尋能耗最低且滿足舒適約束的策略…"):
+                st.session_state.opt = sim.optimize_policy(
+                    day, comfort_min=ctarget, n_iter=180)
+        if "opt" in st.session_state:
+            b = st.session_state.opt["best"]
+            if b:
+                st.success(f"✅ 最佳解：省電 **{b['save']:.1%}**，舒適 {b['comfort']:.0%}")
+                if st.button("套用最佳策略到左側滑桿"):
+                    for pk, kk in KEYMAP.items():
+                        st.session_state[kk] = float(b["policy"][pk])
+                    st.rerun()
+                tr = st.session_state.opt["trials"]
+                figo = go.Figure()
+                figo.add_scatter(
+                    x=[t["comfort"] for t in tr if not t["feasible"]],
+                    y=[t["save"] for t in tr if not t["feasible"]],
+                    mode="markers", name="不符舒適", marker=dict(color="#cccccc", size=6))
+                figo.add_scatter(
+                    x=[t["comfort"] for t in tr if t["feasible"]],
+                    y=[t["save"] for t in tr if t["feasible"]],
+                    mode="markers", name="可行解", marker=dict(color="#538135", size=6))
+                figo.add_scatter(x=[b["comfort"]], y=[b["save"]], mode="markers",
+                                 name="最佳", marker=dict(color="#c00000", size=15,
+                                                        symbol="star"))
+                figo.update_layout(height=300, xaxis_title="舒適時間比",
+                                   yaxis_title="節能率", margin=dict(t=10, b=10),
+                                   legend=dict(orientation="h", y=1.25),
+                                   yaxis_tickformat=".0%", xaxis_tickformat=".0%")
+                st.plotly_chart(figo, use_container_width=True)
+            else:
+                st.warning("此約束下找不到可行解，請放寬舒適度下限再搜尋。")
+    st.caption("最佳化目標：在固定 PMV 舒適標準（24.5–27°C）下最小化能耗；決策變數為左側 7 個"
+               "控制參數。真實資料到手後評估器由模擬換成桃捷實測回測，即為 MPC 最佳化雛型。")
 
 # ---------- Tab 3 預測驗證 ----------
 with tab3:

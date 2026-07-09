@@ -90,16 +90,35 @@ def gen_train_day(seed):
                 commuter=commuter, events=events)
 
 
-def simulate(day, mode):
-    """回傳逐分鐘：各車廂溫度、空調電力(kW)、累計 kWh、再生折抵 kWh、舒適比例"""
+# ---- 可調控空調策略參數（最佳化的決策變數）----
+COMFORT_LO, COMFORT_HI = 24.5, 27.0   # 舒適評分帶（固定標準，不可被最佳化調鬆）
+DEFAULT_POLICY = dict(
+    base_sp=26.3,        # 基準設定溫度（滿載目標）°C
+    load_gain=2.0,       # 載客敏感度：設定溫度隨載客率下降幅度
+    empty_sp=27.0,       # 空車漂移設定 °C
+    precool_thresh=40,   # 預冷觸發：預測載客增量(人) 超過此值即啟動
+    precool_sp=25.0,     # 預冷目標 °C
+    brake_gain=1.6,      # 煞車窗口壓縮機加載倍數（>1 才啟用再生耦合）
+    accel_relief=0.45,   # 加速時壓縮機降載係數
+)
+BASELINE_POLICY = dict(base_sp=24.0, load_gain=0.0, empty_sp=24.0,
+                       precool_thresh=1e9, precool_sp=24.0,
+                       brake_gain=1.0, accel_relief=1.0)
+
+
+def simulate(day, mode="railvolt", policy=None):
+    """回傳逐分鐘：各車廂溫度、空調電力(kW)、累計 kWh、再生折抵 kWh、舒適比例。
+    傳入 policy（dict）即以該策略模擬；否則依 mode 用預設策略。"""
+    if policy is None:
+        policy = BASELINE_POLICY if mode == "baseline" else DEFAULT_POLICY
+    p = policy
     occ, route, tout = day["occ"], day["route"], day["tout"]
-    # 預測載客：30 分鐘航廈領先資訊 + 誤差（demo 用；正式版接預測模組輸出）
     rng = np.random.default_rng(7)
     pred = np.roll(occ, -10, axis=0) * rng.normal(1.0, 0.06, occ.shape)
 
     tin = np.full(CARS, T_INIT)
     T_hist = np.zeros((N, CARS))
-    P_hist = np.zeros(N)              # 全列車空調電力 kW
+    P_hist = np.zeros(N)
     kwh = regen = 0.0
     comfort_ok = comfort_tot = 0
     for i in range(N):
@@ -108,34 +127,53 @@ def simulate(day, mode):
         p_train = 0.0
         for c in range(CARS):
             dens = occ[i, c] / CAR_CAP
-            if mode == "baseline":
-                sp = 24.0
-            else:
-                sp = 26.3 - 2.0 * dens                # PMV 帶內隨載客調整
-                if occ[i, c] < 5:
-                    sp = 27.0                          # 空車讓溫度漂移
-                if pred[i, c] - occ[i, c] > 40:
-                    sp = min(sp, 25.0)                 # 預冷啟動
+            sp = p["base_sp"] - p["load_gain"] * dens
+            if occ[i, c] < 5:
+                sp = p["empty_sp"]
+            if pred[i, c] - occ[i, c] > p["precool_thresh"]:
+                sp = min(sp, p["precool_sp"])
             q = float(np.clip(22000 * (tin[c] - sp), 0, AC_MAX))
-            if mode == "railvolt":
-                if ph == "brake":
-                    q = min(q * 1.6 + (4000 if q > 0 else 0), AC_MAX)
-                elif ph == "accel":
-                    q = q * 0.45                       # 加速時壓縮機讓路
-            elec = q / COP / 1000 / 60                 # kWh / 分
+            if ph == "brake" and p["brake_gain"] > 1:
+                q = min(q * p["brake_gain"], AC_MAX)
+                regen += q / COP / 1000 / 60 * 0.45    # 再生電能折抵比例
+            elif ph == "accel":
+                q = q * p["accel_relief"]
+            elec = q / COP / 1000 / 60
             kwh += elec
-            if mode == "railvolt" and ph == "brake":
-                regen += elec * 0.45                   # 再生電能覆蓋比例（試算）
             p_train += q / COP / 1000
             tin[c] += 60.0 / C_TH * (occ[i, c] * Q_PERSON + ua * (tout[i] - tin[c]) - q)
-            if occ[i, c] > 10:                          # 有乘客時計舒適
-                feel = tin[c] + 1.2 * dens             # 擁擠體感修正
+            if occ[i, c] > 10:
+                feel = tin[c] + 1.2 * dens
                 comfort_tot += 1
-                comfort_ok += int(24.6 <= feel <= 27.0)  # 低於下限＝過冷不適
+                comfort_ok += int(COMFORT_LO <= feel <= COMFORT_HI)
         T_hist[i] = tin
         P_hist[i] = p_train
     comfort = comfort_ok / max(comfort_tot, 1)
     return dict(T=T_hist, P=P_hist, kwh=kwh, regen=regen, comfort=comfort, pred=pred)
+
+
+def optimize_policy(day, comfort_min=0.90, n_iter=240, seed=0):
+    """搜尋在舒適度 ≥ comfort_min 約束下、能耗最低的空調策略。
+    以隨機搜尋於參數範圍取樣（無需額外套件），回傳最佳策略與搜尋軌跡。"""
+    base = simulate(day, "baseline")
+    bounds = dict(
+        base_sp=(25.5, 27.0), load_gain=(0.0, 3.5), empty_sp=(26.5, 28.0),
+        precool_thresh=(20, 90), precool_sp=(24.5, 26.0),
+        brake_gain=(1.0, 2.0), accel_relief=(0.3, 1.0))
+    rng = np.random.default_rng(seed)
+    best, trials = None, []
+    # 先評估預設策略作為基準候選
+    cands = [DEFAULT_POLICY.copy()]
+    for _ in range(n_iter):
+        cands.append({k: float(rng.uniform(*b)) for k, b in bounds.items()})
+    for pol in cands:
+        r = simulate(day, policy=pol)
+        save = (base["kwh"] - r["kwh"]) / base["kwh"]
+        feasible = r["comfort"] >= comfort_min
+        trials.append(dict(save=save, comfort=r["comfort"], feasible=feasible))
+        if feasible and (best is None or r["kwh"] < best["kwh"]):
+            best = dict(policy=pol, kwh=r["kwh"], comfort=r["comfort"], save=save)
+    return dict(base_kwh=base["kwh"], best=best, trials=trials, bounds=bounds)
 
 
 def fit_predictor(n_days=12, test_seed=42):
